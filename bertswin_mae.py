@@ -490,13 +490,17 @@ class BertsWinMAE(nn.Module):
             'mae_mask_1d': mask
         }
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_features(self, x: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for Feature Extraction (Inference / Downstream tasks).
         Runs the encoder on the full, unmasked image.
 
         Args:
-            x (torch.Tensor): Input images, shape (B, C, D, H, W).
+            x (torch.Tensor): Input images, shape (B, C, D, H, W)
+            valid_mask: Boolean mask (B, N_patches). 
+                        True = keep original patch (tissue).
+                        False = replace with [MASK] token (background).
+                        If None, no masking is applied.
 
         Returns:
             torch.Tensor: The encoded feature maps, e.g., (B, C_enc, D_grid, H_grid, W_grid).
@@ -509,10 +513,16 @@ class BertsWinMAE(nn.Module):
         # 2. Embed ALL patches
         x_visible_spatial = x_patches_raw.view(B * N, self.in_chans, self.patch_size, self.patch_size, self.patch_size)
         x_visible_embedded = self.patch_embed(x_visible_spatial)
-        x_full = x_visible_embedded.view(B, N, C_enc)
+        x_tokens = x_visible_embedded.view(B, N, C_enc)
+
+        if valid_mask is not None:
+            # valid_mask shape: (B, N) -> (B, N, C)
+            mask_expanded = valid_mask.unsqueeze(-1).expand(-1, -1, C_enc)
+            mask_token = self.mask_token_enc.to(x_tokens.dtype) # (1, 1, C)
+            x_tokens = torch.where(mask_expanded, x_tokens, mask_token)
 
         # 3. Add Positional Embedding
-        x = x_full + self.pos_embed
+        x = x_tokens + self.pos_embed
         
         # 4. Run Swin Encoder
         x_spatial_in = x.view(B, self.grid_size[0], self.grid_size[1], self.grid_size[2], C_enc)
@@ -520,6 +530,49 @@ class BertsWinMAE(nn.Module):
         
         # 5. Return features in (B, C, D, H, W) layout
         return encoded_features.permute(0, 4, 1, 2, 3).contiguous()
+    
+    def extract_volumetric_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extracts hierarchical features from the full 3D input volume avoiding patch partitioning.
+
+        This method processes the entire input tensor directly through the convolutional 
+        stem and Swin Transformer encoder. Unlike the patch-based training routine, 
+        this approach preserves the global spatial context during normalization 
+        and significantly reduces kernel launch overhead by operating on a single 
+        contiguous volume rather than thousands of individual patches.
+
+        Args:
+            x (torch.Tensor): Input 3D image tensor with shape (B, C_in, D, H, W).
+                              Dimensions (D, H, W) must be divisible by the patch size.
+
+        Returns:
+            torch.Tensor: Encoded spatiotemporal features with shape (B, C_enc, D', H', W'),
+                          where (D', H', W') = (D, H, W) / patch_size.
+        """
+        # 1. Global Convolutional Stem
+        # Projects high-res input directly to feature space: 
+        # (B, C_in, D, H, W) -> (B, C_enc, D/p, H/p, W/p)
+        x_stem = self.patch_embed(x)
+
+        # 2. Tensor Permutation for Transformer Compatibility
+        # Swin Transformer expects channel-last format: (B, D', H', W', C_enc)
+        x_spatial = x_stem.permute(0, 2, 3, 4, 1).contiguous()
+        
+        B, D_grid, H_grid, W_grid, C_enc = x_spatial.shape
+
+        # 3. Add Positional Embeddings
+        # Flatten spatial dims to (B, N, C) for broadcasting with pos_embed (1, N, C)
+        x_tokens = x_spatial.view(B, -1, C_enc)
+        x_tokens = x_tokens + self.pos_embed
+
+        # 4. Swin Transformer Encoder
+        # Reshape back to grid for window-based attention mechanism
+        x_swin_input = x_tokens.view(B, D_grid, H_grid, W_grid, C_enc)
+        encoded_features_swin = self.features(x_swin_input)
+
+        # 5. Feature Reconstruction
+        # Restore standard PyTorch channel-first layout: (B, C_enc, D', H', W')
+        return encoded_features_swin.permute(0, 4, 1, 2, 3).contiguous()
 
 # ===================================================================
 # 3. Factory Functions (TIMM-style)
