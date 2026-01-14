@@ -18,11 +18,12 @@ The model depends on standard PyTorch and Torchvision libraries.
 
 ```bash
 pip install torch torchvision numpy
+
 ```
 
 ## Usage
 
-### 1\. Initialization
+### 1. Initialization
 
 You can initialize the model with custom parameters or use the factory function for a standard base configuration.
 
@@ -46,18 +47,16 @@ model = bertswin_mae_base_patch16_224(in_chans=1)
 
 if torch.cuda.is_available():
     model = model.cuda()
+
 ```
 
-### 2\. Pre-training (Masked Autoencoding)
+### 2. Pre-training (Masked Autoencoding)
 
-During pre-training, the model randomly masks a portion of the input patches and attempts to reconstruct the full volume.
+During pre-training, the model randomly masks a portion of the input patches and attempts to reconstruct the full volume using isolated patch processing in the stem.
 
 ```python
 # Create a dummy 3D volume batch: (Batch, Channel, Depth, Height, Width)
 input_volume = torch.randn(2, 1, 224, 224, 224).cuda()
-
-# Optional: Provide a mask for valid regions (e.g., Field of View)
-# valid_mask = ... (Batch, N_patches) or None
 
 # Forward pass
 output = model(input_volume, valid_for_masking_mask=None)
@@ -65,27 +64,48 @@ output = model(input_volume, valid_for_masking_mask=None)
 reconstructed_cube = output['reconstructed_cube']   # (B, 1, 224, 224, 224)
 mae_mask = output['mae_mask_1d']                    # (B, N_patches) - Binary mask (1=masked)
 
-print(f"Reconstruction shape: {reconstructed_cube.shape}")
 ```
 
-### 3\. Feature Extraction
+### 3. Volumetric Inference Adaptation (Stem Tuning)
 
-For downstream tasks (segmentation, classification), you can extract dense feature representations from the encoder. This skips the masking and decoding steps.
+A critical architectural distinction of BertsWinMAE is the discrepancy between the training and inference modes of the CNN Stem.
+
+* **Training (Patch-based):** Patches are physically cropped *before* entering the stem. The CNN processes isolated cubes (), resulting in learned features that encode artificial boundary effects.
+* **Inference (Volumetric):** Ideally, the full volume () is processed continuously to preserve global spatial consistency and eliminate kernel launch overhead.
+
+Directly applying the pre-trained stem to full volumes introduces a distribution shift, placing the encoder in an **Out-of-Distribution (OOD)** state. To resolve this, we propose a short adaptation stage using `tbj_experiments/tune_cnnstem.py`.
+
+This procedure:
+
+1. **Freezes** the Transformer Encoder and Decoder to preserve learned semantic representations.
+2. **Unlocks** the CNN Stem.
+3. Fine-tunes the stem on full, unmasked volumes (100% patches) to bridge the domain gap and adapt feature statistics for continuous volumetric inference.
+
+```bash
+python tbj_experiments/tune_cnnstem.py
+```
+
+### 4. Feature Extraction
+
+After stem tuning, the model is fully adapted for volumetric inputs. Use `extract_volumetric_features` for efficient downstream tasks (segmentation, classification).
 
 ```python
-# Extract features from the encoder
-features = model.extract_features(input_volume)
+# Extract features from the encoder using the adapted volumetric stem
+# Input: Full 3D Volume (B, C, D, H, W)
+# Processing: Continuous convolution (no patch splitting)
+features = model.extract_volumetric_features(input_volume)
 
 # Output shape: (B, Embed_Dim, Grid_D, Grid_H, Grid_W)
 # For 224^3 input and patch_size=16, grid is 14^3
-print(f"Encoded features: {features.shape}") 
+print(f"Volumetric features: {features.shape}") 
 # Expected: torch.Size([2, 768, 14, 14, 14])
+
 ```
 
 ## Configuration Parameters
 
 | Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
+| --- | --- | --- | --- |
 | `img_size` | `tuple` | `(224, 224, 224)` | Input volume dimensions (Depth, Height, Width). |
 | `patch_size` | `int` | `16` | The size of the cubic patch (P). Must be a power of 2. |
 | `in_chans` | `int` | `1` | Number of input channels (e.g., 1 for grayscale CT). |
@@ -99,8 +119,21 @@ print(f"Encoded features: {features.shape}")
 
 ## Limitations & Constraints
 
-1.  **Input Size Divisibility:** The dimensions of `img_size` must be perfectly divisible by `patch_size`.
-2.  **Power of 2 Patch Size:** The `patch_size` must be a power of 2 (e.g., 8, 16, 32) to ensure the dynamic CNN stem and decoder function correctly.
-3.  **Window Size:** The `swin_window_size` cannot be larger than the calculated grid size (Input Size // Patch Size).
-4.  **Non-Hierarchical:** This model is designed as a columnar (BERT-style) transformer. It does not support multi-stage downsampling within the Transformer encoder itself; all downsampling happens in the CNN stem.
+1. **Input Size Divisibility:** The dimensions of `img_size` must be perfectly divisible by `patch_size`.
+2. **Power of 2 Patch Size:** The `patch_size` must be a power of 2 (e.g., 8, 16, 32) to ensure the dynamic CNN stem and decoder function correctly.
+3. **Window Size:** The `swin_window_size` cannot be larger than the calculated grid size (Input Size // Patch Size).
+4. **Non-Hierarchical:** This model is designed as a columnar (BERT-style) transformer. It does not support multi-stage downsampling within the Transformer encoder itself; all downsampling happens in the CNN stem.
 
+## Citation
+
+If you use this code or models in your research, please cite our preprint:
+
+**BertsWin: Resolving Topological Sparsity in 3D Masked Autoencoders via Component-Balanced Structural Optimization** *Evgeny Alves Limarenko, Anastasiia Studenikina* [Preprint](https://www.arxiv.org/abs/2512.21769)
+
+```bibtex
+@article{bertswinmae2025,
+  title={BertsWin: Resolving Topological Sparsity in 3D Masked Autoencoders via Component-Balanced Structural Optimization},
+  author={Evgeny Alves Limarenko, Anastasiia Studenikina},
+  journal={arXiv preprint arXiv:2512.21769},
+  year={2025}
+}
