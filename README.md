@@ -11,6 +11,7 @@ It combines the local feature extraction capabilities of a **3D CNN Stem**, the 
   * **Dynamic CNN Stem:** Automatically adapts the depth of the convolutional stem based on the provided `patch_size`.
   * **Lightweight Reconstruction:** Uses an efficient CNN decoder to upsample latent representations back to the voxel space.
   * **3D Native:** Built from the ground up for volumetric data (D, H, W).
+  * **Strict Non-Overlapping Stem (Optional):** Offers an alternative non-overlapping CNN stem (strict_stem=True) designed to extract clean hierarchical skip-connections. This is critical for dense prediction downstream tasks (e.g., U-Net decoders) and Multi-Task Learning (MTL) with dynamic masking strategies.
 
 ## Installation
 
@@ -39,7 +40,8 @@ model = BertsWinMAE(
     encoder_embed_dim=768,
     encoder_depths=[12],
     encoder_num_heads=[12],
-    mask_ratio=0.75
+    mask_ratio=0.75,
+    strict_stem=False # Set to True for dense prediction tasks and skip-connections
 )
 
 # Option B: Factory Function (Base Config)
@@ -68,22 +70,35 @@ mae_mask = output['mae_mask_1d']                    # (B, N_patches) - Binary ma
 
 ### 3. Volumetric Inference Adaptation (Stem Tuning)
 
-A critical architectural distinction of BertsWinMAE is the discrepancy between the training and inference modes of the CNN Stem.
+During MAE pre-training, the model processes heavily masked, isolated patches. However, for inference and downstream tasks, processing thousands of isolated patches creates massive kernel launch overhead. To maximize performance, we switch to **Volumetric Mode**, feeding the entire 3D volume into the model continuously.
 
-* **Training (Patch-based):** Patches are physically cropped *before* entering the stem. The CNN processes isolated cubes (), resulting in learned features that encode artificial boundary effects.
-* **Inference (Volumetric):** Ideally, the full volume () is processed continuously to preserve global spatial consistency and eliminate kernel launch overhead.
+Because moving from isolated patches to a continuous volume introduces boundary and padding shifts, the CNN Stem must be adapted to avoid out-of-distribution (OOD) degradation. We freeze the Transformer and fine-tune *only* the stem using `tbj_experiments/tune_cnnstem.py`.
 
-Directly applying the pre-trained stem to full volumes introduces a distribution shift, placing the encoder in an **Out-of-Distribution (OOD)** state. To resolve this, we propose a short adaptation stage using `tbj_experiments/tune_cnnstem.py`.
+Choose your workflow based on your downstream task:
 
-This procedure:
+#### Workflow A: Standard Extraction (Classification / No Skips)
+*Best performance and simplest pipeline.*
+1. **Pre-train:** Train the standard model (default CNN stem with padding).
+2. **Tune:** Run the stem tuning script using the default stem.
+3. **Inference:** Use `extract_volumetric_features`. Tests show the standard stem's padding yields slightly better representation quality when skip-connections are not required.
 
-1. **Freezes** the Transformer Encoder and Decoder to preserve learned semantic representations.
-2. **Unlocks** the CNN Stem.
-3. Fine-tunes the stem on full, unmasked volumes (100% patches) to bridge the domain gap and adapt feature statistics for continuous volumetric inference.
+#### Workflow B: Dense Prediction (Segmentation / Requires Skips)
+*Fastest path to segmentation without pre-training from scratch.*
+1. **Pre-train:** Train the standard model (default CNN stem) for optimal SSL convergence.
+2. **Tune:** Swap the stem by initializing the tuning script with `strict_stem=True`. Fine-tune this new non-overlapping stem on full volumes.
+3. **Inference:** The model is now ready to output both global features and hierarchical skip-connections using `extract_volumetric_features(..., return_skips=True)`.
+
+#### Workflow C: Dense Pre-training / MTL (Advanced)
+*Use only if your pre-training phase actively requires processing a full 100% visible patch grid (e.g., localized pathology detection combined with SSL).*
+1. **Pre-train:** Initialize the model with `strict_stem=True` from the start and train on dense volumetric grids.
+2. **Inference:** Direct feature extraction using `extract_volumetric_features(..., return_skips=True)`.
+
+**Running the Tuning Script:**
+The tuning logic, including Gradient Conductor (GCond) optimization and patch-vs-volumetric baseline validation, is provided in the experiments folder.
 
 ```bash
+# Configure your paths and target checkpoint inside the script before running
 python tbj_experiments/tune_cnnstem.py
-```
 
 ### 4. Feature Extraction
 
@@ -102,6 +117,28 @@ print(f"Volumetric features: {features.shape}")
 
 ```
 
+### 5. Dense Prediction and Multi-Task Learning (MTL)
+
+The original CNN stem excels at processing heavily masked isolated patches during SSL pre-training. However, for dense prediction tasks (like segmentation) or MTL setups requiring dynamic masking (e.g., 100% visible patches for fine pathologies, 25% for SSL), the model supports a strict non-overlapping stem (`strict_stem=True`).
+
+This mode allows the extraction of hierarchical skip-connections and raw patch tokens before the Transformer encoder.
+
+```python
+# 1. Extracting Volumetric Features with Skip-Connections
+# Requires initializing the model with strict_stem=True
+features, skips = model.extract_volumetric_features(input_volume, return_skips=True)
+
+print(f"Main features: {features.shape}") # (B, 768, 14, 14, 14)
+print(f"Number of skip levels: {len(skips)}")
+
+# 2. Extracting Raw Tokens for Dynamic Masking (MTL)
+# Bypasses Positional Embeddings and Transformer for custom masking logic
+tokens, skips = model.extract_tokens(input_volume, return_skips=True)
+
+print(f"Raw tokens: {tokens.shape}") # (B, 2744, 768)
+
+```
+
 ## Configuration Parameters
 
 | Parameter | Type | Default | Description |
@@ -116,6 +153,7 @@ print(f"Volumetric features: {features.shape}")
 | `decoder_embed_dim` | `int` | `512` | Feature dimension before the decoder CNN. |
 | `stem_base_dim` | `int` | `48` | Base channel width for the CNN patch embedding stem. |
 | `mask_ratio` | `float` | `0.75` | Percentage of patches to mask during training (0.0 to 1.0). |
+| `strict_stem` | `bool` | `False` | Activates the non-overlapping CNN stem, enabling `return_skips` for dense downstream tasks. |
 
 ## Limitations & Constraints
 

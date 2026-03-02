@@ -86,8 +86,8 @@ class StemTuningConfig(BaseConfig):
     Inherits from the base training configuration.
     """
     # Experiment Identifiers
-    RUN_NAME: str = 'bertswin_adam_l2'
-    PRETRAINED_CHECKPOINT_PATH: str = '/med_data/cbct-ct/dntum_mae/checkpoints_bertswin_adam_l2/best_model.pth'
+    RUN_NAME: str = 'bertswin_physloss_skip'
+    PRETRAINED_CHECKPOINT_PATH: str = '/med_data/cbct-ct/dntum_mae/checkpoints_bertswin_gcond_phy/best_model.pth'#latest_checkpoint.pth'#
     
     # Paths
     EXPERIMENTS_DIR: Path = Path('/med_data/cbct-ct/dntum_mae_tuned/')
@@ -104,6 +104,7 @@ class StemTuningConfig(BaseConfig):
     EPOCHS: int = 50
     TRAIN_STEPS_PER_EPOCH: int = 200
     MAE_MASK_RATIO: float = 0.0  # No masking during stem tuning
+    STRICT_STEM: bool = True
     
     # Loss Configuration
     TRAIN_LOSS_TYPE: str = 'custom_ssim'
@@ -479,7 +480,8 @@ def main():
         swin_window_size=cfg.SWIN_WINDOW_SIZE,
         decoder_embed_dim=cfg.DECODER_EMBED_DIM,
         stem_base_dim=cfg.STEM_BASE_DIM,
-        mask_ratio=0.0
+        mask_ratio=0.0,
+        strict_stem=cfg.STRICT_STEM
     ).to(device)
 
     # 2. Load Pre-trained Weights
@@ -488,7 +490,7 @@ def main():
     
     checkpoint = torch.load(cfg.PRETRAINED_CHECKPOINT_PATH, map_location=device, weights_only=False)
     sd = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-    original_model.load_state_dict(clean_state_dict(sd), strict=True)
+    original_model.load_state_dict(clean_state_dict(sd), strict=False)#True
     
     # 3. Data Loading
     train_loader, val_loader, train_ids, val_ids = prepare_dataloaders(rank, world_size, cfg, checkpoint=None)

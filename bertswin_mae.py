@@ -102,6 +102,40 @@ def patchify_image(image_cube: torch.Tensor, patch_size: int) -> torch.Tensor:
 # 2. Main Model Class
 # ===================================================================
 
+class StrictStem(nn.Module):
+    """
+    Hierarchical non-overlapping 3D CNN stem.
+    Optionally provides intermediate feature maps (skips) for dense prediction tasks.
+    """
+    def __init__(self, in_chans: int, out_dim: int, patch_size: int, stem_base_dim: int):
+        super().__init__()
+        self.stages = nn.ModuleList()
+        
+        in_c = in_chans
+        current_dim = stem_base_dim
+        num_stages = int(math.log2(patch_size))
+
+        for _ in range(num_stages):
+            self.stages.append(nn.Sequential(
+                nn.Conv3d(in_c, current_dim, kernel_size=2, stride=2, padding=0, bias=False),
+                nn.GroupNorm(4, current_dim),
+                nn.GELU()
+            ))
+            in_c = current_dim
+            current_dim *= 2
+
+        self.proj = nn.Conv3d(in_c, out_dim, kernel_size=1, stride=1)
+
+    def forward(self, x: torch.Tensor, return_skips: bool = False):
+        skips = []
+        for stage in self.stages:
+            x = stage(x)
+            if return_skips:
+                skips.append(x)
+                
+        out = self.proj(x)
+        return (out, skips) if return_skips else out
+
 class BertsWinMAE(nn.Module):
     """
     The 3D BertsWin Masked Autoencoder (MAE) model.
@@ -135,6 +169,7 @@ class BertsWinMAE(nn.Module):
         decoder_embed_dim: int = 512,
         stem_base_dim: int = 48,
         mask_ratio: float = 0.75,
+        strict_stem: bool = False,
     ):
         super().__init__()
         
@@ -144,6 +179,7 @@ class BertsWinMAE(nn.Module):
         self.in_chans = in_chans
         self.mask_ratio = mask_ratio
         self.encoder_embed_dim = encoder_embed_dim
+        self.strict_stem = strict_stem
 
         # Validation Check 1: Patch size must be a power of 2
         if not (patch_size > 0 and (patch_size & (patch_size - 1) == 0)):
@@ -177,12 +213,20 @@ class BertsWinMAE(nn.Module):
             )
 
         # --- 1. Per-Patch CNN Stem (Patch Embedding) ---
-        self.patch_embed = self._build_patch_embed(
-            in_chans=in_chans, 
-            out_dim=encoder_embed_dim,
-            patch_size=patch_size,
-            stem_base_dim=stem_base_dim
-        )
+        if self.strict_stem:
+            self.patch_embed = StrictStem(
+                in_chans=in_chans, 
+                out_dim=encoder_embed_dim,
+                patch_size=patch_size,
+                stem_base_dim=stem_base_dim
+            )
+        else:
+            self.patch_embed = self._build_patch_embed(
+                in_chans=in_chans, 
+                out_dim=encoder_embed_dim,
+                patch_size=patch_size,
+                stem_base_dim=stem_base_dim
+            )
 
         # --- 2. Positional Embedding and Mask Token ---
         pos_embed = _get_3d_sincos_pos_embed(encoder_embed_dim, self.grid_size)
@@ -243,7 +287,7 @@ class BertsWinMAE(nn.Module):
             nn.Conv3d(in_c, out_dim, kernel_size=1, stride=1)
         )
         return nn.Sequential(*layers)
-
+    
     def _build_swin_stages(self, embed_dim: int, depths: List[int], 
                            num_heads: List[int], window_size: Tuple[int, int, int],
                            grid_size: Tuple[int, int, int]) -> nn.Module:
@@ -531,48 +575,68 @@ class BertsWinMAE(nn.Module):
         # 5. Return features in (B, C, D, H, W) layout
         return encoded_features.permute(0, 4, 1, 2, 3).contiguous()
     
-    def extract_volumetric_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_volumetric_features(self, x: torch.Tensor, return_skips: bool = False):
         """
-        Extracts hierarchical features from the full 3D input volume avoiding patch partitioning.
-
-        This method processes the entire input tensor directly through the convolutional 
-        stem and Swin Transformer encoder. Unlike the patch-based training routine, 
-        this approach preserves the global spatial context during normalization 
-        and significantly reduces kernel launch overhead by operating on a single 
-        contiguous volume rather than thousands of individual patches.
-
-        Args:
-            x (torch.Tensor): Input 3D image tensor with shape (B, C_in, D, H, W).
-                              Dimensions (D, H, W) must be divisible by the patch size.
-
-        Returns:
-            torch.Tensor: Encoded spatiotemporal features with shape (B, C_enc, D', H', W'),
-                          where (D', H', W') = (D, H, W) / patch_size.
-        """
-        # 1. Global Convolutional Stem
-        # Projects high-res input directly to feature space: 
-        # (B, C_in, D, H, W) -> (B, C_enc, D/p, H/p, W/p)
-        x_stem = self.patch_embed(x)
-
-        # 2. Tensor Permutation for Transformer Compatibility
-        # Swin Transformer expects channel-last format: (B, D', H', W', C_enc)
-        x_spatial = x_stem.permute(0, 2, 3, 4, 1).contiguous()
+        Extracts hierarchical features from the full 3D input volume.
         
+        Args:
+            x (torch.Tensor): Input 3D image tensor (B, C_in, D, H, W).
+            return_skips (bool): If True, returns (features, skips). Requires strict_stem=True.
+            
+        Returns:
+            torch.Tensor or Tuple[torch.Tensor, List[torch.Tensor]]
+        """
+        if return_skips and not self.strict_stem:
+            raise ValueError("Skip connections are only supported when strict_stem=True.")
+
+        # 1. Global Convolutional Stem
+        if return_skips:
+            x_stem, skips = self.patch_embed(x, return_skips=True)
+        else:
+            x_stem = self.patch_embed(x)
+
+        # 2. Tensor Permutation for Transformer
+        x_spatial = x_stem.permute(0, 2, 3, 4, 1).contiguous()
         B, D_grid, H_grid, W_grid, C_enc = x_spatial.shape
 
         # 3. Add Positional Embeddings
-        # Flatten spatial dims to (B, N, C) for broadcasting with pos_embed (1, N, C)
-        x_tokens = x_spatial.view(B, -1, C_enc)
-        x_tokens = x_tokens + self.pos_embed
+        x_tokens = x_spatial.view(B, -1, C_enc) + self.pos_embed
 
         # 4. Swin Transformer Encoder
-        # Reshape back to grid for window-based attention mechanism
         x_swin_input = x_tokens.view(B, D_grid, H_grid, W_grid, C_enc)
         encoded_features_swin = self.features(x_swin_input)
 
         # 5. Feature Reconstruction
-        # Restore standard PyTorch channel-first layout: (B, C_enc, D', H', W')
-        return encoded_features_swin.permute(0, 4, 1, 2, 3).contiguous()
+        out_features = encoded_features_swin.permute(0, 4, 1, 2, 3).contiguous()
+        
+        return (out_features, skips) if return_skips else out_features
+
+    def extract_tokens(self, x: torch.Tensor, return_skips: bool = False):
+        """
+        Processes full volumetric input and returns a flattened sequence of patch tokens.
+        
+        Args:
+            x (torch.Tensor): Input volume (B, C_in, D, H, W).
+            return_skips (bool): If True, returns (tokens, skips). Requires strict_stem=True.
+            
+        Returns:
+            torch.Tensor or Tuple[torch.Tensor, List[torch.Tensor]]
+        """
+        if return_skips and not self.strict_stem:
+            raise ValueError("Skip connections are only supported when strict_stem=True.")
+
+        # 1. Global forward pass
+        if return_skips:
+            x_features, skips = self.patch_embed(x, return_skips=True)
+        else:
+            x_features = self.patch_embed(x)
+        
+        # 2. Permute and flatten
+        x_spatial = x_features.permute(0, 2, 3, 4, 1).contiguous()
+        B, D_grid, H_grid, W_grid, C_enc = x_spatial.shape
+        x_tokens = x_spatial.view(B, -1, C_enc)
+        
+        return (x_tokens, skips) if return_skips else x_tokens
 
 # ===================================================================
 # 3. Factory Functions (TIMM-style)
