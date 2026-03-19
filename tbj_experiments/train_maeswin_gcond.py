@@ -56,7 +56,7 @@ try:
         HounsfieldUnitInterpolator,
         CTNoiseSimulatorGPU,
         prepare_dataloaders,
-        HybridMAE,
+        BertsWinMAE,
         L2MAELoss,
         SubpatchSSIMLoss,
         PhysicsInformedMAELoss,
@@ -81,9 +81,9 @@ class Config(BaseConfig):
     # --- Paths ---
     DATA_HDF5_PATH = './tbj_cbct.hdf5'
     EXPERIMENTS_DIR = Path('/workspace/experiments/')
-    RUN_NAME = 'bertswin_gcond_ssim_a'
-    CHECKPOINT_DIR = EXPERIMENTS_DIR / Path('checkpoints_' + RUN_NAME)
-    LOG_DIR = EXPERIMENTS_DIR / Path('logs_' + RUN_NAME)
+    RUN_NAME = 'bertswin_gcond_phy'
+    CHECKPOINT_DIR = EXPERIMENTS_DIR / RUN_NAME/ Path('checkpoints')
+    LOG_DIR = EXPERIMENTS_DIR / RUN_NAME / Path('logs')
     
     SEED = 42
     
@@ -97,11 +97,11 @@ class Config(BaseConfig):
     GRADIENT_CLIP_VAL = 10.0
     GPU_BATCH_SIZE_TRAIN = 10
     GPU_BATCH_SIZE_VAL = 6
-    NUM_WORKERS_TRAIN = 6
+    NUM_WORKERS_TRAIN = 5
     NUM_WORKERS_VAL = 4
     
-    TRAIN_LOSS_TYPE = 'ssim_a' # ssim_a, l2, custom_ssim
-    VALIDATION_PRIMARY_LOSS = 'ssim_a_final_loss' # ssim_a_final_loss, custom_ssim_final_loss
+    TRAIN_LOSS_TYPE = 'custom_ssim' # ssim_a, l2, custom_ssim
+    VALIDATION_PRIMARY_LOSS = 'custom_ssim_final_loss' # ssim_a_final_loss, custom_ssim_final_loss
     PHY_LOSS_WEIGHTS = (0.3, 0.5, 0.2)
     LCS_LOSS_WEIGHTS = (0.3, 0.2, 0.5) # br, cntr, str
     LOSS_SUB_PATCH_SIZE = 8
@@ -123,7 +123,7 @@ class Config(BaseConfig):
 
     WARMUP_EPOCHS = 20
     COSINE_ETA_MIN = LEARNING_RATE / 10
-    PATIENCE_EPOCHS = 50
+    PATIENCE_EPOCHS = 200
     SCHEDULER_TYPE = 'Cosine'
 
 # =================================================================================
@@ -323,7 +323,9 @@ def main():
     rank, world_size = setup_ddp()
     set_seed(cfg.SEED, rank)
     
-    device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}")
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
     setup_logging(rank, cfg.LOG_DIR)
     if rank == 0:
         cfg.CHECKPOINT_DIR.mkdir(exist_ok=True, parents=True)
@@ -340,8 +342,18 @@ def main():
     
     train_loader, val_loader, train_ids, val_ids = prepare_dataloaders(rank, world_size, cfg, checkpoint)
     
-    model = HybridMAE(cfg).to(device)
-    model.initialize_weights()
+    model = BertsWinMAE(
+        img_size=cfg.INPUT_CUBE_SIZE,              
+        patch_size=cfg.EFFECTIVE_PATCH_SIZE,       
+        in_chans=1,
+        encoder_embed_dim=cfg.ENCODER_EMBED_DIM,   
+        encoder_depths=cfg.SWIN_DEPTHS,            
+        encoder_num_heads=cfg.SWIN_NUM_HEADS,      
+        swin_window_size=cfg.SWIN_WINDOW_SIZE,     
+        decoder_embed_dim=cfg.DECODER_EMBED_DIM,   
+        stem_base_dim=cfg.STEM_BASE_DIM,           
+        mask_ratio=cfg.MAE_MASK_RATIO
+    ).to(device)
     model = torch.compile(model)
     if world_size > 1:
         model = DDP(model, device_ids=[int(os.environ["LOCAL_RANK"])])
@@ -494,6 +506,7 @@ def main():
              model, val_loader, loss_factory, cfg, device, epoch, rank, world_size, writer
         )
         
+        stop_signal = torch.tensor(0, device=device)
         if rank == 0:
             main_train_loss = train_metrics['final_loss']
             main_val_loss = val_metrics[cfg.VALIDATION_PRIMARY_LOSS]
@@ -539,11 +552,15 @@ def main():
                 
             early_stopper(main_val_loss)
             if early_stopper.early_stop:
+                stop_signal += 1
                 logging.info("Early stopping. Training finished.")
-                break
 
         if world_size > 1:
-            dist.barrier()
+            dist.broadcast(stop_signal, src=0)
+            dist.barrier(device_ids=[local_rank])
+
+        if stop_signal.item() == 1:
+            break
             
     if rank == 0 and writer:
         writer.close()

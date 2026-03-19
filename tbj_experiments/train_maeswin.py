@@ -894,7 +894,8 @@ class TMJDataset(Dataset):
             "bb_origin_in_roi": torch.from_numpy(bb_origin).float(),
             "fov_center_in_roi": torch.from_numpy(fov_center_in_roi).float(),
             "fov_radius": torch.tensor(self.cfg.FOV_RADIUS_VOXELS, dtype=torch.float32),
-            #"tmj_center": torch.from_numpy(tmj_center).float()
+            "tmj_center": torch.from_numpy(tmj_center).float(),
+            "target_cube_center": torch.from_numpy(target_cube_center).float()
         }
         
 def collate_fn(batch):
@@ -1387,13 +1388,13 @@ def process_batch_on_gpu(
     sub_mask_gpu = batch['sub_mask'].unsqueeze(1).to(dtype) 
     target_size_torch = (B, 1, *cfg.INPUT_CUBE_SIZE)
 
-    grid = F.affine_grid(theta, target_size_torch, align_corners=False)
+    grid = F.affine_grid(theta, target_size_torch, align_corners=True)
 
     target_cube = F.grid_sample(
-        sub_volume_gpu, grid, mode='bilinear', padding_mode='zeros', align_corners=False
+        sub_volume_gpu, grid, mode='bilinear', padding_mode='zeros', align_corners=True
     ) # will actually be trilinear
     seg_mask = F.grid_sample(
-        sub_mask_gpu, grid, mode='nearest', padding_mode='zeros', align_corners=False
+        sub_mask_gpu, grid, mode='nearest', padding_mode='zeros', align_corners=True
     ).short()
 
     del sub_volume_gpu, sub_mask_gpu
@@ -1426,6 +1427,11 @@ def process_batch_on_gpu(
             target_cube[i] = torch.flip(target_cube[i], dims=[-1])
             seg_mask[i] = torch.flip(seg_mask[i], dims=[-1])
             fov_mask[i] = torch.flip(fov_mask[i], dims=[-1])
+
+    theta_export = theta.clone()
+    for i in range(len(sides)):
+        if sides[i] == 'left_joint':
+            theta_export[i, :, 0] *= -1.0
 
     soft_tissue_mask = (target_cube > cfg.Z_NORM_SOFT_TISSUE_MIN) & (target_cube < cfg.Z_NORM_SOFT_TISSUE_MAX)
 
@@ -1462,12 +1468,46 @@ def process_batch_on_gpu(
     patch_fov_ratio = fov_mask_patches.mean(dim=-1)
     valid_for_masking_mask = patch_fov_ratio > cfg.PATCH_MASK_FOV_THRESHOLD
 
+    # batch['tmj_center']: [B, 3] (Absolute source coordinates ZYX)
+    # batch['target_cube_center']: [B, 3] (Source coordinate that maps to (0,0,0) in target)
+    diff_zyx = batch['tmj_center'].to(device) - batch['target_cube_center'].to(device)
+
+    # inv_rotation is (Target -> Source), so we need (Source -> Target) which is R^T
+    rot_matrix_source_to_target = batch['inv_rotation'].to(device).transpose(1, 2)
+
+    # --- FIX START: Coordinate System Alignment ---
+    # Scipy Rotation Matrix ожидает вектор [X, Y, Z].
+    # У нас вектор [Z, Y, X].
+    # Мы должны перевернуть вектор, применить матрицу, и перевернуть обратно.
+    
+    # 1. Flip ZYX -> XYZ
+    diff_xyz = torch.flip(diff_zyx, dims=[-1])
+    
+    # 2. Apply Rotation in XYZ space
+    diff_aligned_xyz = torch.bmm(rot_matrix_source_to_target, diff_xyz.unsqueeze(-1)).squeeze(-1)
+    
+    # 3. Flip back XYZ -> ZYX
+    diff_aligned_zyx = torch.flip(diff_aligned_xyz, dims=[-1])
+    # --- FIX END ---
+
+    scale = batch['scale_factor'].to(device).unsqueeze(1)
+    offset_voxels_zyx = diff_aligned_zyx * scale
+
+    for i in range(len(sides)):
+        if sides[i] == 'left_joint':
+            # Для левого сустава мы делали flip по оси X (Width) в начале функции.
+            # Значит, координата X (индекс 2 в ZYX) тоже должна инвертироваться.
+            offset_voxels_zyx[i, 2] *= -1.0
+
     processed_batch = {
         'input_cube': input_cube,
         'target_patches': patchify_image(target_cube, cfg.EFFECTIVE_PATCH_SIZE), 
         'combined_semantic_mask_patches': patchify_image(combined_mask_3d.short(), cfg.EFFECTIVE_PATCH_SIZE),
         'valid_for_masking_mask': valid_for_masking_mask,
         'dense_mask': seg_mask,
+        'affine_matrix': theta_export,
+        'bb_origin': batch['bb_origin_in_roi'],
+        'anatomical_center_offset': offset_voxels_zyx,
         #'transformed_tmj_center': transformed_tmj_center
     }
     
@@ -1747,7 +1787,9 @@ def main():
     rank, world_size = setup_ddp()
     set_seed(cfg.SEED, rank)
     
-    device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}")
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
     setup_logging(rank, cfg.LOG_DIR)
     if rank == 0:
         cfg.CHECKPOINT_DIR.mkdir(exist_ok=True, parents=True)
@@ -1893,7 +1935,6 @@ def main():
         logging.info("Starting training...")
         
     for epoch in range(start_epoch, cfg.EPOCHS):
-        #train_loader.sampler.set_epoch(epoch)
         if world_size > 1:
             val_loader.sampler.set_epoch(epoch)
         
@@ -1910,6 +1951,7 @@ def main():
              model, val_loader, loss_factory, cfg, device, epoch, rank, world_size, writer
         )
         
+        stop_signal = torch.tensor(0, device=device)
         if rank == 0:
             main_train_loss = train_metrics['final_loss']
             main_val_loss = val_metrics[cfg.VALIDATION_PRIMARY_LOSS]
@@ -1954,11 +1996,15 @@ def main():
                 
             early_stopper(main_val_loss)
             if early_stopper.early_stop:
+                stop_signal += 1
                 logging.info("Early stopping. Training finished.")
-                break
 
         if world_size > 1:
-            dist.barrier()
+            dist.broadcast(stop_signal, src=0)
+            dist.barrier(device_ids=[local_rank])
+            
+        if stop_signal.item() == 1:
+            break
             
     if rank == 0 and writer:
         writer.close()
