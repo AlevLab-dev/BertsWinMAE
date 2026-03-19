@@ -354,9 +354,11 @@ def main():
         stem_base_dim=cfg.STEM_BASE_DIM,           
         mask_ratio=cfg.MAE_MASK_RATIO
     ).to(device)
-    model = torch.compile(model)
+    
     if world_size > 1:
         model = DDP(model, device_ids=[int(os.environ["LOCAL_RANK"])])
+
+    model = torch.compile(model)
 
     loss_factory = {
         'custom_ssim': PhysicsInformedMAELoss(cfg).to(device),
