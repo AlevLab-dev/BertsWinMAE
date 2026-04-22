@@ -90,7 +90,7 @@ def patchify_image(image_cube: torch.Tensor, patch_size: int) -> torch.Tensor:
 
     n_d, n_h, n_w = D // p, H // p, W // p
     x = image_cube.view(B, C, n_d, p, n_h, p, n_w, p)
-    x = x.permute(0, 1, 2, 4, 6, 3, 5, 7)
+    x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)
     patches = x.contiguous().view(B, n_d * n_h * n_w, C * p * p * p)
     
     if C == 1:
@@ -485,6 +485,47 @@ class BertsWinMAE(nn.Module):
         D_grid, H_grid, W_grid = self.grid_size
         x_spatial_in = x.view(B, D_grid, H_grid, W_grid, C) 
         encoded_features_bthwc = self.features(x_spatial_in) 
+        encoded_spatial_out = encoded_features_bthwc.permute(0, 4, 1, 2, 3).contiguous()
+ 
+        return encoded_spatial_out, mask
+    
+    def forward_encoder_dense(
+        self, 
+        x_stem_spatial: torch.Tensor, 
+        valid_for_masking_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Runs the BertsWin-style encoder from dense features.
+        Useful for Multi-Task Learning (MTL) where the stem processes 100% of the input
+        before a mask is applied.
+        
+        Args:
+            x_stem_spatial (torch.Tensor): Feature map from the stem (B, C_enc, D_grid, H_grid, W_grid).
+            valid_for_masking_mask (Optional[torch.Tensor]): Boolean mask (B, N) indicating 
+                which patches are valid for masking.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 
+                - Encoded spatial features (B, C_enc, D_grid, H_grid, W_grid)
+                - MAE mask (B, N) where 1 indicates masked, 0 indicates visible.
+        """
+        B, C_enc, D_grid, H_grid, W_grid = x_stem_spatial.shape
+        N = D_grid * H_grid * W_grid
+        
+        # (B, C_enc, D_grid, H_grid, W_grid) -> (B, C_enc, N) -> (B, N, C_enc)
+        x_tokens = x_stem_spatial.flatten(2).transpose(1, 2)
+        
+        dummy_input = torch.empty((B, N, 1), device=x_stem_spatial.device)
+        _, mask, _ = self.random_masking(dummy_input, valid_for_masking_mask)
+        
+        mask_expanded = mask.unsqueeze(-1).expand(-1, -1, C_enc).bool()
+        mask_token = self.mask_token_enc.to(x_tokens.dtype) # (1, 1, C_enc)
+        
+        x_masked = torch.where(mask_expanded, mask_token, x_tokens)
+
+        x = x_masked + self.pos_embed
+        x_spatial_in = x.view(B, D_grid, H_grid, W_grid, C_enc)
+        encoded_features_bthwc = self.features(x_spatial_in) # -> (B, D_grid, H_grid, W_grid, C_enc)
         encoded_spatial_out = encoded_features_bthwc.permute(0, 4, 1, 2, 3).contiguous()
  
         return encoded_spatial_out, mask

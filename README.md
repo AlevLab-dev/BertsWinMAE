@@ -137,6 +137,11 @@ tokens, skips = model.extract_tokens(input_volume, return_skips=True)
 
 print(f"Raw tokens: {tokens.shape}") # (B, 2744, 768)
 
+x_stem_spatial = model.patch_embed(input_volume) # (B, 768, 14, 14, 14)
+encoded_features, mae_mask = model.forward_encoder_dense(x_stem_spatial, valid_for_masking_mask=None)
+
+print(f"Encoded masked features: {encoded_features.shape}")
+
 ```
 
 ## Configuration Parameters
